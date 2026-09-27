@@ -1,166 +1,80 @@
-# pi-cliproxyapi-quota
+# pi-cliproxyapi-quota — personal feature branch
 
-[![npm version](https://img.shields.io/npm/v/pi-cliproxyapi-quota.svg)](https://www.npmjs.com/package/pi-cliproxyapi-quota)
-[![license](https://img.shields.io/npm/l/pi-cliproxyapi-quota.svg)](./LICENSE)
+English | [简体中文](README.zh-CN.md)
 
-**English** | [中文](#中文说明)
+This branch builds on [songhuiming2007-coder/pi-cliproxyapi-quota](https://github.com/songhuiming2007-coder/pi-cliproxyapi-quota). It includes the Antigravity active-model pool fix plus optional compact formatting, macOS Keychain authentication, provider filtering, and startup/periodic refresh. These personal enhancements are separate from the upstream correctness PR.
 
-A [pi](https://pi.dev) extension for users who route their AI subscriptions into pi through
-[CLIProxyAPI / EasyCLIProxyAPI](https://github.com/router-for-me/EasyCLIProxyAPI).
-
-It surfaces subscription limits for reverse-proxied models inside pi:
-
-- **Quota** — see subscription limits for **every OAuth provider** the proxy holds without leaving pi.
-
-Supported providers: **Claude**, **Antigravity / Gemini Code Assist**, and **Kimi** (verified), plus
-**Codex** and **xAI / Grok** (best‑effort, shown as `(unverified)` until confirmed against a real
-account — see [Scope](#scope--limitations)).
-
-## Features
-
-| Trigger | What it does |
-|---|---|
-| `/quota` | For each credential the proxy holds, show every quota window: used %, remaining %, reset countdown. |
-| `Ctrl+Shift+Q` | Same as `/quota`, but works **while the model is streaming** (it's a shortcut, not a queued command). |
-| footer `Quota[claude] 5h 64% left · 7d 95% left` | Remaining % for the provider of the **current model** (follows model switches; falls back to the first credential). Auto‑refreshed at the start/end of each turn (throttled to 60s). |
-
-The quota data path mirrors the EasyCLIProxyAPI control panel exactly: the proxy management API
-`POST /v0/management/api-call` proxies each provider's own usage endpoint (e.g. Anthropic
-`/api/oauth/usage`, Google `retrieveUserQuotaSummary`) using the stored OAuth credential. These
-endpoints report utilization; they do not consume quota. Disabled credentials are skipped.
-
-For an explicit Antigravity route (for example, provider `cliproxy-antigravity`),
-the footer uses the current model's shared pool: Gemini models use the Gemini pool;
-Claude and GPT-OSS use the Claude/GPT pool. The full `/quota` view still includes
-all groups. If the matching pool is missing, the model alias is unknown, or more
-than one enabled Antigravity credential exists, no Antigravity footer is shown:
-the extension cannot infer which account the proxy will use. It never substitutes
-another provider's quota for this route. Switching models clears the previous
-footer immediately; late responses cannot overwrite the newly selected model.
-
-## Install
-
-```bash
-pi install npm:pi-cliproxyapi-quota
-# or from git:
-pi install git:github.com/songhuiming2007-coder/pi-cliproxyapi-quota
+```text
+5h 67.2% (2h51m) · w 89.1% (6d21h)
 ```
 
-Or load a local checkout by adding its path to `~/.pi/agent/settings.json`:
+Percentages mean remaining capacity; parentheses show time until reset. Gemini uses the Gemini pool; Claude and GPT-OSS routed through Antigravity use the Claude/GPT pool.
+
+## Install on any machine
+
+Requires Node.js 22.19+ and Pi. Install the Git branch, **not the upstream npm package**, to get these changes:
+
+```sh
+pi install git:github.com/samwei12/pi-cliproxyapi-quota@feature/personal-quota-footer
+```
+
+Remove any previous local `pi-cliproxy-quota` package entry to avoid duplicate footers, then `/reload`. Use `pi list` to confirm the Git source. To update this source:
+
+```sh
+pi update git:github.com/samwei12/pi-cliproxyapi-quota@feature/personal-quota-footer
+```
+
+This branch is not published to npm. It does not change inference providers or default models.
+
+## Configure independently on each machine
+
+Create `~/.pi/agent/cliproxyapi-quota.json` (inside `PI_CODING_AGENT_DIR` if set; legacy `PI_AGENT_DIR` is also supported):
 
 ```json
-{ "extensions": ["/absolute/path/to/pi-cliproxyapi-quota/index.ts"] }
+{
+  "footerStyle": "compact",
+  "footerProviders": ["cliproxy-antigravity"],
+  "keychain": {
+    "service": "CLIPROXY_MANAGEMENT_KEY"
+  }
+}
 ```
 
-Reload pi (`/reload`) after installing.
+- `footerStyle`: `compact` uses the example above; omitted/`default` retains the upstream formatter.
+- `footerProviders`: exact Pi provider names whose footer should be shown. Use the provider configured on that machine. Omit to allow the upstream-supported providers. `[]` disables automatic footer queries. `/quota` remains an explicit all-provider query.
+- `keychain`: optional macOS login Keychain item. Account defaults to the current OS username; use `keychain.account` for a different item account. The item must already exist. No key is written to this repository or copied between machines. Failure of an explicitly configured Keychain source does not fall back to a plaintext key.
+- `accountName`: optional exact authentication-file name. Multiple Antigravity credentials require explicit selection for a footer; this is not an aggregate or a guarantee about proxy load-balancing.
 
-## Configuration
+The proxy URL resolves from `CLIPROXYAPI_BASE_URL`, then `~/.pi/agent/cliproxyapi.json` `baseUrl`, then `http://127.0.0.1:8317`. Management key resolution is: `CLIPROXYAPI_MANAGEMENT_KEY` environment variable → explicitly configured Keychain → legacy `managementKey` JSON field → EasyCLIProxyAPI GUI config. Legacy paths are preserved for compatibility; do not commit credentials. On non-macOS systems use the environment variable and omit `keychain`. Management HTTP redirects are rejected.
 
-No secrets are stored in this package. At runtime it resolves:
+A work machine must have its own reachable CLIProxy instance (or an explicitly configured accessible endpoint), management authentication, and the matching inference provider. Installing this package alone does not set up the proxy or transfer OAuth credentials. `localhost` always means the machine running Pi, not another computer.
 
-**Base URL** (proxy): `CLIPROXYAPI_BASE_URL` → `~/.pi/agent/cliproxyapi.json` `baseUrl` → `http://127.0.0.1:8317`
+## Usage
 
-**Management key** (required for `/quota`), in order:
-1. env `CLIPROXYAPI_MANAGEMENT_KEY`
-2. `~/.pi/agent/cliproxyapi-quota.json` → `{ "managementKey": "..." }`
-3. EasyCLIProxyAPI GUI `config.toml` (`management-secret-key`), auto‑located per‑OS:
-   - macOS: `~/Library/Application Support/com.cpa.gui/config.toml`
-   - Linux: `$XDG_CONFIG_HOME/com.cpa.gui/config.toml`
-   - Windows: `%APPDATA%\com.cpa.gui\config.toml`
+- Startup, model changes, settled turns and a 60-second timer refresh the footer (throttled/coalesced).
+- Automatic queries access only the current provider, preserving unrelated account quotas and avoiding unnecessary requests.
+- Switching away clears the footer. Old responses cannot overwrite a newer selection.
+- `/cliproxy-quota`: refresh the current-model footer.
+- `/quota` or `Ctrl+Shift+Q`: upstream full quota view across enabled credentials, including account labels.
+- Missing data displays `n/a`; a failed query shows `Quota unavailable`. A missing/ambiguous Antigravity pool never falls back to another provider.
+- Noninteractive sessions do not automatically query quota or read Keychain secrets.
 
-If you don’t run the GUI, set `CLIPROXYAPI_MANAGEMENT_KEY` (must match your proxy's
-`remote-management.secret-key`) or the JSON override.
+The underlying upstream adapters support Claude, Antigravity/Gemini, Kimi, and best-effort Codex/xAI (the latter remain unverified as upstream declares). The personal live validation covers Antigravity, not every provider. Arbitrary model aliases and load-balancer account selection cannot be inferred.
 
-## Scope & limitations
-
-- **Verified** (tested against live accounts): `claude`, `antigravity` / `gemini`.
-- **Unverified** (ported from the EasyCLIProxyAPI panel, endpoints + parsers wired but not yet tested
-  against a real account): `codex`, `xai` / `grok`. These are labelled `(unverified)` in the
-  output. If one is wrong for your account, please open an issue with the raw response — easy to fix.
-- Reads a local management key to call the localhost management API; nothing is sent anywhere except
-  your own proxy and each provider's usage endpoint (through that proxy). Disabled credentials are skipped.
-
-## License
-
-MIT
-
----
-
-## 中文说明
-
-适用于通过 [CLIProxyAPI / EasyCLIProxyAPI](https://github.com/router-for-me/EasyCLIProxyAPI)
-把各 AI 订阅接入 [pi](https://pi.dev) 的用户。它补上了 pi 对反向代理模型不暴露的订阅配额：
-
-- **额度** — 在 pi 里直接看代理持有的**每个 OAuth 提供方**的订阅限额。
-
-支持的提供方：**Claude**、**Antigravity / Gemini Code Assist**、**Kimi**（已验证），以及 **Codex**、
-**xAI / Grok**（尽力支持，在真实账号上校准前显示为 `(unverified)`）。
-
-### 功能
-
-| 触发 | 作用 |
-|---|---|
-| `/quota` | 对代理持有的每个凭证，显示其所有配额窗口：已用 %、剩余 %、重置倒计时。 |
-| `Ctrl+Shift+Q` | 同 `/quota`，但**模型正在输出时也能按**（快捷键，不会被排队）。 |
-| footer `Quota[claude] 5h 64% left · 7d 95% left` | 显示**当前模型**对应服务的剩余 %（随模型切换，取不到时回退到第一个凭证）；每轮开始/结束自动刷新（60s 节流）。 |
-
-取数链路与 EasyCLIProxyAPI 控制面板完全一致：代理管理 API `POST /v0/management/api-call`
-用存储的 OAuth 凭证代理请求各提供方自己的用量端点（如 Anthropic `/api/oauth/usage`、
-Google `retrieveUserQuotaSummary`）。这些端点只报告用量，不消耗额度；禁用的凭证会跳过。
-
-对于明确标识 Antigravity 的通道（例如 provider 为 `cliproxy-antigravity`），底栏只显示当前模型对应的共享池：Gemini 使用 Gemini 池，Claude 与 GPT-OSS 使用 Claude/GPT 池。`/quota` 的完整视图仍保留全部分组。如果对应池缺失、模型别名无法识别，或存在多个已启用的 Antigravity 凭证，则不显示该通道的底栏额度，因为扩展无法确定代理会选择哪个账号；不会拿其他供应商的额度替代。切换模型时立即清除旧底栏，迟到的响应不会覆盖新模型的显示。
-
-### 安装
-
-```bash
-pi install npm:pi-cliproxyapi-quota
-# 或从 git：
-pi install git:github.com/songhuiming2007-coder/pi-cliproxyapi-quota
-```
-
-或把本地目录的路径加到 `~/.pi/agent/settings.json`：
-
-```json
-{ "extensions": ["/absolute/path/to/pi-cliproxyapi-quota/index.ts"] }
-```
-
-安装后 `/reload` 重载 pi。
-
-### 配置
-
-本包不存储任何密钥，运行时解析：
-
-**Base URL**（代理）：`CLIPROXYAPI_BASE_URL` → `~/.pi/agent/cliproxyapi.json` 的 `baseUrl` → `http://127.0.0.1:8317`
-
-**管理密钥**（`/quota` 必需），按顺序：
-1. 环境变量 `CLIPROXYAPI_MANAGEMENT_KEY`
-2. `~/.pi/agent/cliproxyapi-quota.json` 的 `{ "managementKey": "..." }`
-3. EasyCLIProxyAPI GUI 的 `config.toml`（`management-secret-key`），按系统自动定位：
-   - macOS：`~/Library/Application Support/com.cpa.gui/config.toml`
-   - Linux：`$XDG_CONFIG_HOME/com.cpa.gui/config.toml`
-   - Windows：`%APPDATA%\com.cpa.gui\config.toml`
-
-不用 GUI 的话，设置 `CLIPROXYAPI_MANAGEMENT_KEY`（需与代理的 `remote-management.secret-key` 一致）或用上述 JSON 覆盖。
-
-### 范围与限制
-
-- **已验证**（在真实账号上实测）：`claude`、`antigravity` / `gemini`。
-- **未验证**（按 EasyCLIProxyAPI 面板移植，端点与解析已接但未在真实账号上跑过）：`codex`、
-  `xai` / `grok`，输出里标 `(unverified)`。若某家在你账号上不对，请带原始返回开 issue，很容易修。
-- 仅读取本地管理密钥去调本机管理 API；除了你自己的代理和（经代理的）各提供方用量端点，不向任何地方发送数据；禁用的凭证会跳过。
-
-### 许可证
-
-MIT
-
-## Offline regression tests / 离线回归测试
+## Validation and privacy
 
 ```sh
 npm test
 ```
 
-Uses synthetic credentials and mocked HTTP responses; no local credentials or
-live accounts are read. Covers route precedence, pool selection, missing/ambiguous
-quota, compatibility with existing callers, and model-switch response races.
+Offline tests use synthetic credentials and mocked HTTP. They cover routing, pool selection, multiple accounts, formatting, Keychain error redaction, provider filtering and model-switch races. Local live validation can reuse a Keychain item without printing it. Quota requests use CLIProxy management `api-call`; they do not invoke model inference.
 
-仅使用合成凭证与模拟 HTTP 响应，不读取本机凭证或真实账号。覆盖通道优先级、额度池选择、缺失或多账号情况、既有调用兼容性及模型切换时的响应竞争。
+No machine-specific paths, private account identifiers, tokens or quota snapshots are included in this fork. Authors and the GitHub fork owner remain public attribution. Shared remaining percentages are not individual model allowances, token counts or guarantees of upstream capacity.
+
+## Rollback
+
+Remove the Git source with `pi remove` using the same source string, then restore the previous local package entry and `/reload`. This does not delete the old checkout, local settings or Keychain item.
+
+## License
+
+MIT; upstream copyright and attribution are preserved in [LICENSE](LICENSE).

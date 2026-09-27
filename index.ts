@@ -13,14 +13,16 @@
  */
 
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ---------- config resolution ----------
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8317";
-const AGENT_DIR = process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent");
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent");
 
 // EasyCLIProxyAPI GUI config.toml candidate locations, per platform.
 function guiConfigCandidates(): string[] {
@@ -80,6 +82,37 @@ export function resolveManagementKey(): string | undefined {
 	);
 }
 
+interface Preferences {
+	footerStyle?: "compact" | "default";
+	footerProviders?: string[];
+	accountName?: string;
+	keychain?: { service: string; account?: string };
+}
+export function readPreferences(): Preferences {
+	const value = readJson(join(AGENT_DIR, "cliproxyapi-quota.json")) ?? {};
+	if (value.footerStyle !== undefined && !["compact", "default"].includes(String(value.footerStyle))) throw new Error("INVALID_CONFIG");
+	if (value.footerProviders !== undefined && (!Array.isArray(value.footerProviders) || value.footerProviders.some(p => typeof p !== "string" || !p))) throw new Error("INVALID_CONFIG");
+	if (value.accountName !== undefined && (typeof value.accountName !== "string" || !value.accountName)) throw new Error("INVALID_CONFIG");
+	return value as Preferences;
+}
+export async function resolveKeychainKey(settings: { service: string; account?: string }, run = promisify(execFile)): Promise<string> {
+	if (process.platform !== "darwin" || !settings || typeof settings.service !== "string" || !settings.service || (settings.account !== undefined && (typeof settings.account !== "string" || !settings.account))) throw new Error("KEYCHAIN_UNAVAILABLE");
+	try {
+		const result = await run("/usr/bin/security", ["find-generic-password", "-a", settings.account || userInfo().username,
+			"-s", settings.service, "-w", join(homedir(), "Library/Keychains/login.keychain-db")], { timeout: 15000, maxBuffer: 65536 });
+		const key = result.stdout.toString().trim();
+		if (!key) throw new Error();
+		return key;
+	} catch { throw new Error("KEYCHAIN_UNAVAILABLE"); }
+}
+export async function resolveManagementKeyForQuota(): Promise<string | undefined> {
+	const env = firstString(process.env.CLIPROXYAPI_MANAGEMENT_KEY);
+	if (env) return env;
+	const preferences = readPreferences();
+	if (preferences.keychain) return resolveKeychainKey(preferences.keychain);
+	return resolveManagementKey();
+}
+
 // ---------- management API ----------
 
 interface AuthFile {
@@ -97,6 +130,7 @@ interface AuthFile {
 async function mgmtGet<T>(base: string, key: string, path: string): Promise<T> {
 	const res = await fetch(`${base}/v0/management/${path}`, {
 		headers: { Authorization: `Bearer ${key}` },
+		redirect: "error",
 		signal: AbortSignal.timeout(20_000),
 	});
 	if (!res.ok) throw new Error(`GET ${path} -> HTTP ${res.status}`);
@@ -110,6 +144,7 @@ async function mgmtApiCall(
 ): Promise<{ status_code: number; body: string }> {
 	const res = await fetch(`${base}/v0/management/api-call`, {
 		method: "POST",
+		redirect: "error",
 		headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
 		body: JSON.stringify(body),
 		signal: AbortSignal.timeout(30_000),
@@ -421,16 +456,18 @@ export async function collectQuota(
 	now = Date.now(),
 	prefer?: string | null,
 	model?: { provider?: string; id?: string },
+	options: { compact?: boolean; currentOnly?: boolean; accountName?: string } = {},
 ): Promise<{ blocks: string[]; footer: string }> {
 	const creds = await listCredentials(base, key);
 	const known = creds
 		.filter((c) => ADAPTERS[providerKey(c)])
+		.filter(c => !options.currentOnly || (providerKey(c) === prefer && (!options.accountName || c.name === options.accountName)))
 		.sort((a, b) => (providerKey(a) === "claude" ? 0 : 1) - (providerKey(b) === "claude" ? 0 : 1));
 	if (known.length === 0) throw new Error("NO_CRED");
 	const blocks: string[] = [];
 	const summaries = new Map<string, string>(); // providerKey -> one-line summary
 	const activeAntigravity = prefer === "antigravity" && model !== undefined;
-	const antigravityAccounts = known.filter(c => providerKey(c) === "antigravity");
+	const antigravityAccounts = known.filter(c => providerKey(c) === "antigravity" && (!options.accountName || c.name === options.accountName));
 	for (const c of known) {
 		const pk = providerKey(c);
 		const adapter = ADAPTERS[pk];
@@ -442,10 +479,10 @@ export async function collectQuota(
 			blocks.push(...renderWindows(wins, now));
 			const footerWins = activeAntigravity && pk === "antigravity"
 				? windowsForModel(wins, model) : wins;
-			const s = summaryFromWins(footerWins, now);
+			const s = options.compact ? compactSummaryFromWins(footerWins, now) : summaryFromWins(footerWins, now);
 			// We cannot infer which credential a load balancer will use.
 			const ambiguous = activeAntigravity && pk === "antigravity" && antigravityAccounts.length !== 1;
-			if (!ambiguous && s !== "Quota n/a" && !summaries.has(pk)) summaries.set(pk, s);
+			if ((!options.accountName || pk !== prefer || c.name === options.accountName) && !ambiguous && s !== "Quota n/a" && !summaries.has(pk)) summaries.set(pk, s);
 		} catch (err) {
 			blocks.push(`● ${who} [${pk}]${tag}\n  failed: ${(err as Error).message}`);
 		}
@@ -464,9 +501,9 @@ export async function collectQuota(
 	const stamp = `@${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 	const footer =
 		hit && actual
-			? (summaries.size > 1 || actual !== prefer
+			? (options.compact && actual === prefer ? hit : (summaries.size > 1 || actual !== prefer
 				? hit.replace("Quota ", `Quota[${actual}] `)
-				: hit) + ` ${stamp}`
+				: hit) + ` ${stamp}`)
 			: "";
 	return { blocks, footer };
 }
@@ -541,6 +578,26 @@ export function summaryFromWins(wins: Win[], now = Date.now()): string {
 	return parts.length ? `Quota ${parts.join(" · ")}` : "Quota n/a";
 }
 
+/** Optional personal footer; the default upstream renderer is unchanged. */
+export function compactSummaryFromWins(wins: Win[], now = Date.now()): string {
+	if (!wins.length) return "Quota n/a";
+	return ["5h", "7d"].map(tag => {
+		const matches = wins.filter(w => shortTag(w.label) === tag);
+		const w = matches.length === 1 ? matches[0] : undefined;
+		const valid = typeof w?.remainingPct === "number" && Number.isFinite(w.remainingPct);
+		const percent = valid ? `${Number(w!.remainingPct!.toFixed(1))}%` : "n/a";
+		const reset = w?.resetIso ? Date.parse(w.resetIso) : NaN;
+		let countdown = "";
+		if (Number.isFinite(reset)) {
+			const mins = Math.ceil((reset - now) / 60000);
+			countdown = mins <= 0 ? "reset pending" : mins < 60 ? `${mins}m`
+				: mins < 1440 ? `${Math.floor(mins / 60)}h${mins % 60 ? `${mins % 60}m` : ""}`
+				: `${Math.floor(mins / 1440)}d${Math.floor((mins % 1440) / 60)}h`;
+		}
+		return `${tag === "7d" ? "w" : tag} ${percent}${countdown ? ` (${countdown})` : ""}`;
+	}).join(" · ");
+}
+
 // ---------- extension ----------
 
 function isPrimaryUiSession(ctx: ExtensionContext): boolean {
@@ -548,76 +605,79 @@ function isPrimaryUiSession(ctx: ExtensionContext): boolean {
 }
 
 export default function (pi: ExtensionAPI): void {
-	// Switching models switches the footer to that provider's quota immediately.
-	pi.on("model_select", (_e, ctx) => {
-		modelRevision++;
-		if (isPrimaryUiSession(ctx)) ctx.ui.setStatus(QUOTA_KEY, undefined);
-		lastFooterFetch = 0;
-		refreshFooterThrottled(ctx);
-	});
-
-	// ----- /quota -----
 	const QUOTA_KEY = "cliproxy-quota";
 	let lastFooterFetch = 0;
 	let modelRevision = 0;
+	let currentContext: ExtensionContext | undefined;
+	let timer: ReturnType<typeof setInterval> | undefined;
+	let inFlight = false;
+	let disposed = false;
 
-	async function collectUsage(now: number, prefer?: string | null, model?: { provider?: string; id?: string }): Promise<{ blocks: string[]; footer: string }> {
-		const base = resolveBaseUrl();
-		const key = resolveManagementKey();
-		if (!key) throw new Error("NO_KEY");
-		return collectQuota(base, key, now, prefer, model);
+	function enabled(ctx: ExtensionContext): boolean {
+		if (disposed || !isPrimaryUiSession(ctx)) return false;
+		const providers = readPreferences().footerProviders;
+		return !providers || providers.includes(ctx.model?.provider ?? "");
 	}
-
-	// silent=true only refreshes the footer (used for auto-refresh during/after a turn).
 	async function runQuota(ctx: ExtensionContext, silent = false): Promise<void> {
 		const revision = modelRevision;
 		const model = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 		if (!silent) ctx.ui.notify("Fetching quota…", "info");
 		try {
-			const { blocks, footer } = await collectUsage(Date.now(), providerFromModel(model), model);
-			if (!silent) ctx.ui.notify(`Subscription quota\n${blocks.join("\n")}`, "info");
-			if (revision === modelRevision && isPrimaryUiSession(ctx)) {
-				ctx.ui.setStatus(QUOTA_KEY, footer ? ctx.ui.theme.fg("dim", footer) : undefined);
+			const preferences = readPreferences();
+			const key = await resolveManagementKeyForQuota();
+			if (!key) throw new Error("NO_KEY");
+			const { blocks, footer } = await collectQuota(resolveBaseUrl(), key, Date.now(), providerFromModel(model), model, {
+				compact: preferences.footerStyle === "compact", currentOnly: silent, accountName: preferences.accountName,
+			});
+			if (!silent && !disposed) ctx.ui.notify(`Subscription quota\n${blocks.join("\n")}`, "info");
+			if (!disposed && revision === modelRevision && enabled(ctx)) ctx.ui.setStatus(QUOTA_KEY, footer ? ctx.ui.theme.fg("dim", footer) : undefined);
+		} catch {
+			if (!disposed && revision === modelRevision && isPrimaryUiSession(ctx)) {
+				ctx.ui.setStatus(QUOTA_KEY, ctx.ui.theme.fg("dim", "Quota unavailable (/cliproxy-quota to retry)"));
 			}
-		} catch (err) {
-			if (revision === modelRevision && isPrimaryUiSession(ctx)) ctx.ui.setStatus(QUOTA_KEY, undefined);
-			if (silent) return;
-			const msg = (err as Error).message;
-			if (msg === "NO_KEY") {
-				ctx.ui.notify(
-					'Management key not found. Set CLIPROXYAPI_MANAGEMENT_KEY, or write {"managementKey":"..."} to ~/.pi/agent/cliproxyapi-quota.json, or make sure the EasyCLIProxyAPI GUI has a management-secret-key configured.',
-					"error",
-				);
-			} else if (msg === "NO_CRED") {
-				ctx.ui.notify(
-					"No usable OAuth credential found (claude / codex / antigravity / gemini / kimi / xai).",
-					"warning",
-				);
-			} else {
-				ctx.ui.notify(`Failed to fetch quota: ${msg}`, "error");
-			}
+			if (!silent && !disposed) ctx.ui.notify("Quota unavailable. Check management authentication, account selection and connectivity.", "error");
 		}
 	}
-
-	// Auto-refresh footer: first turn start + each turn end, throttled to 60s, silent.
-	function refreshFooterThrottled(ctx: ExtensionContext): void {
-		if (!isPrimaryUiSession(ctx)) return;
-		const now = Date.now();
-		if (now - lastFooterFetch < 60_000) return;
-		lastFooterFetch = now;
-		void runQuota(ctx, true);
+	function refreshFooterThrottled(ctx: ExtensionContext, force = false): void {
+		try {
+			if (!enabled(ctx)) { if (ctx.hasUI) ctx.ui.setStatus(QUOTA_KEY, undefined); return; }
+		} catch { if (ctx.hasUI) ctx.ui.setStatus(QUOTA_KEY, "Quota configuration invalid"); return; }
+		if (inFlight || (!force && Date.now() - lastFooterFetch < 60000)) return;
+		lastFooterFetch = Date.now();
+		inFlight = true;
+		const revision = modelRevision;
+		void runQuota(ctx, true).finally(() => {
+			inFlight = false;
+			if (!disposed && revision !== modelRevision && currentContext) refreshFooterThrottled(currentContext, true);
+		});
 	}
-	pi.on("before_agent_start", (_e, ctx) => refreshFooterThrottled(ctx));
-	pi.on("agent_settled", (_e, ctx) => refreshFooterThrottled(ctx));
-
-	// Works while streaming: shortcut fetches and shows quota immediately.
-	pi.registerShortcut("ctrl+shift+q", {
-		description: "Show subscription quota (all OAuth providers)",
-		handler: (ctx) => runQuota(ctx),
+	function select(ctx: ExtensionContext) {
+		currentContext = ctx;
+		modelRevision++;
+		lastFooterFetch = 0;
+		if (ctx.hasUI) ctx.ui.setStatus(QUOTA_KEY, undefined);
+		refreshFooterThrottled(ctx);
+	}
+	pi.on("session_start", (_e, ctx) => {
+		disposed = false;
+		select(ctx);
+		if (isPrimaryUiSession(ctx)) {
+			if (timer) clearInterval(timer);
+			timer = setInterval(() => { if (currentContext) refreshFooterThrottled(currentContext); }, 60000);
+			timer.unref?.();
+		}
 	});
-
-	pi.registerCommand("quota", {
-		description: "Show subscription quota for all OAuth providers (via CLIProxyAPI)",
-		handler: async (_args, ctx) => runQuota(ctx),
+	pi.on("model_select", (_e, ctx) => select(ctx));
+	pi.on("before_agent_start", (_e, ctx) => { currentContext = ctx; refreshFooterThrottled(ctx); });
+	pi.on("agent_settled", (_e, ctx) => { currentContext = ctx; refreshFooterThrottled(ctx); });
+	pi.on("session_shutdown", () => {
+		disposed = true;
+		modelRevision++;
+		if (timer) clearInterval(timer);
+		if (currentContext?.hasUI) currentContext.ui.setStatus(QUOTA_KEY, undefined);
+		currentContext = undefined;
 	});
+	pi.registerShortcut("ctrl+shift+q", { description: "Show subscription quota (all OAuth providers)", handler: ctx => runQuota(ctx) });
+	pi.registerCommand("quota", { description: "Show subscription quota for all OAuth providers (via CLIProxyAPI)", handler: async (_args, ctx) => runQuota(ctx) });
+	pi.registerCommand("cliproxy-quota", { description: "Refresh current-model quota footer", handler: async (_args, ctx) => { currentContext = ctx; refreshFooterThrottled(ctx, true); } });
 }

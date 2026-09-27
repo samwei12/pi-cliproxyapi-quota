@@ -19,8 +19,9 @@ A pi extension that allows setups routing subscriptions into pi through CLIProxy
 - The management key (`management-secret-key`) is **never written to any file in this repo**. It is
   resolved at runtime in this order:
   1. env `CLIPROXYAPI_MANAGEMENT_KEY`
-  2. `~/.pi/agent/cliproxyapi-quota.json` field `managementKey` (optional override)
-  3. EasyCLIProxyAPI GUI `config.toml` `management-secret-key` (default source), located per-OS:
+  2. Explicit optional `keychain` config: macOS login Keychain, asynchronous lookup; fail closed without legacy fallback.
+  3. `~/.pi/agent/cliproxyapi-quota.json` field `managementKey` (optional override)
+  4. EasyCLIProxyAPI GUI `config.toml` `management-secret-key` (default source), located per-OS:
      macOS `~/Library/Application Support/com.cpa.gui/config.toml`,
      Linux `$XDG_CONFIG_HOME/com.cpa.gui/config.toml`,
      Windows `%APPDATA%\com.cpa.gui\config.toml`.
@@ -55,3 +56,7 @@ Add this directory's `index.ts` absolute path to the `extensions` array in
 - npm (public, appears in the pi.dev/packages gallery via the `pi-package` keyword) and GitHub git.
 - Bump version, push with tags, then `npm publish --otp=<code>` (2FA required):
   `npm version patch && git push --follow-tags && npm publish --otp=<code>`.
+
+## Personal feature branch
+
+`feature/personal-quota-footer` layers optional compact rendering, provider filtering, startup/periodic refresh and Keychain auth on top of the upstream bugfix branch. Do not push these extras to `feature/antigravity-model-quota` (the upstream PR head). Use `npm test`; live smoke must not print any part of a management key. This fork is distributed through its Git branch, not the upstream npm name.

@@ -1,6 +1,6 @@
 // Live smoke test of the quota data path + pure renderers.
 // Run: node test-quota.mjs
-import { resolveBaseUrl, resolveManagementKey, collectQuota, renderWindows, summaryFromWins, formatReset } from "./index.ts";
+import { resolveBaseUrl, resolveManagementKeyForQuota, collectQuota, renderWindows, summaryFromWins, formatReset } from "./index.ts";
 
 // formatReset unit checks
 const now = Date.parse("2026-08-19T09:00:00Z");
@@ -30,9 +30,9 @@ console.assert(summaryFromWins(nearFull, now) === "Quota 5h 100% left", "footer 
 console.log("units OK:", summaryFromWins(wins, now));
 
 const base = resolveBaseUrl();
-const key = resolveManagementKey();
+const key = await resolveManagementKeyForQuota();
 console.log("baseUrl:", base);
-console.log("managementKey:", key ? key.slice(0, 6) + "…(" + key.length + " chars)" : "NONE");
+console.log("managementKey:", key ? "available" : "NONE");
 if (!key) process.exit(1);
 
 const { blocks, footer } = await collectQuota(base, key);

@@ -1,6 +1,12 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
+import { mkdtempSync, rmSync, writeFileSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+const agentDir=mkdtempSync(join(tmpdir(),'pi-quota-tests-'));
+process.env.PI_CODING_AGENT_DIR=agentDir;
+after(()=>rmSync(agentDir,{recursive:true,force:true}));
 import assert from 'node:assert/strict';
-import extension, { providerFromModel, parseQuotaSummary, windowsForModel, collectQuota, summaryFromWins, formatReset } from './index.ts';
+const {default:extension, providerFromModel, parseQuotaSummary, windowsForModel, collectQuota, summaryFromWins, compactSummaryFromWins, formatReset, resolveKeychainKey, resolveManagementKeyForQuota}=await import('./index.ts');
 
 const now = Date.parse('2026-09-27T12:00:00Z');
 const resetTime = '2026-09-27T15:00:00Z';
@@ -89,5 +95,45 @@ test('late request for previous model cannot overwrite new-model status',async t
  const ctx={hasUI:true,mode:'tui',model:model('gemini-3-flash'),ui:{setStatus:(_,text)=>statuses.push(text),theme:{fg:(_,text)=>text},notify:()=>{}}};
  hooks.model_select({},ctx);while(!release)await new Promise(r=>setImmediate(r));
  ctx.model=model('claude-opus-4-6-thinking');hooks.model_select({},ctx);await new Promise(r=>setImmediate(r));
- assert.match(statuses.at(-1),/63%.*81%/);release();await new Promise(r=>setImmediate(r));assert.match(statuses.at(-1),/63%.*81%/);
+ assert.equal(statuses.at(-1),undefined);release();await new Promise(r=>setImmediate(r));await new Promise(r=>setImmediate(r));assert.match(statuses.at(-1),/63%.*81%/);hooks.session_shutdown();
+});
+
+
+test('compact formatting preserves precision, unknown values and reset countdown',()=>{
+ const wins=[{label:'5-hour',remainingPct:67.2,resetIso:new Date(now+171*60000).toISOString()},{label:'7-day',remainingPct:89.1,resetIso:new Date(now+165*3600000).toISOString()}];
+ assert.equal(compactSummaryFromWins(wins,now),'5h 67.2% (2h51m) · w 89.1% (6d21h)');
+ assert.equal(compactSummaryFromWins([{label:'5-hour',remainingPct:null,resetIso:null}],now),'5h n/a · w n/a');
+});
+
+test('compact current-only queries skip unrelated account providers',async t=>{
+ installFetch(t,[claude,ag]);
+ const r=await collectQuota('http://proxy.test','synthetic-key',now,'antigravity',model('claude-opus'),{compact:true,currentOnly:true});
+ assert.match(r.footer,/^5h 63% \(3h\) · w 81% \(3h\)$/);
+ assert.doesNotMatch(r.blocks.join(' '),/synthetic-claude/);
+});
+
+test('explicit account selection supports multiple accounts without combining balances',async t=>{
+ installFetch(t,[ag,{...ag,name:'other.json',auth_index:'other'}]);
+ const r=await collectQuota('http://proxy.test','synthetic-key',now,'antigravity',model('claude-opus'),{compact:true,currentOnly:true,accountName:'other.json'});
+ assert.match(r.footer,/63%.*81%/);assert.equal(r.blocks.filter(x=>x.startsWith('●')).length,1);
+});
+
+test('keychain errors are redacted; missing explicit keychain does not fall back',async()=>{
+ const config=join(agentDir,'cliproxyapi-quota.json');
+ writeFileSync(config,JSON.stringify({keychain:{service:''},managementKey:'do-not-fallback'}));
+ const previous=process.env.CLIPROXYAPI_MANAGEMENT_KEY;delete process.env.CLIPROXYAPI_MANAGEMENT_KEY;
+ try{
+  await assert.rejects(resolveManagementKeyForQuota(),e=>e.message==='KEYCHAIN_UNAVAILABLE');
+  await assert.rejects(resolveKeychainKey({service:'test'},async()=>{throw new Error('private-secret')}),e=>e.message==='KEYCHAIN_UNAVAILABLE');
+ }finally{unlinkSync(config);if(previous!==undefined)process.env.CLIPROXYAPI_MANAGEMENT_KEY=previous;}
+});
+
+test('headless sessions and unlisted providers never query management',async t=>{
+ writeFileSync(join(agentDir,'cliproxyapi-quota.json'),JSON.stringify({footerProviders:['cliproxy-antigravity']}));
+ t.after(()=>unlinkSync(join(agentDir,'cliproxyapi-quota.json')));
+ let calls=0;t.mock.method(globalThis,'fetch',async()=>{calls++;throw new Error('must not query')});
+ const hooks={};extension({on:(n,f)=>hooks[n]=f,registerCommand:()=>{},registerShortcut:()=>{}});
+ const ctx={hasUI:true,mode:'json',model:model('claude-opus'),ui:{setStatus:()=>{},theme:{fg:(_,s)=>s},notify:()=>{}}};
+ hooks.session_start({},ctx);await new Promise(r=>setImmediate(r));assert.equal(calls,0);
+ ctx.mode='tui';ctx.model={provider:'openai-codex',id:'gpt-6-astra'};hooks.model_select({},ctx);await new Promise(r=>setImmediate(r));assert.equal(calls,0);hooks.session_shutdown();
 });
