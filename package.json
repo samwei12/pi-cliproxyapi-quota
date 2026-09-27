@@ -39,5 +39,8 @@
     "index.ts",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test-model-quota.mjs"
+  }
 }
