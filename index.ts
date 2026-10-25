@@ -15,6 +15,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ---------- config resolution ----------
@@ -92,6 +93,7 @@ interface AuthFile {
 	email?: string;
 	label?: string;
 	project_id?: string;
+	path?: string;
 }
 
 async function mgmtGet<T>(base: string, key: string, path: string): Promise<T> {
@@ -204,11 +206,13 @@ const claudeAdapter: Adapter = {
 	},
 };
 
-// ---- antigravity / gemini code assist (VERIFIED): POST retrieveUserQuotaSummary ----
-// Mirror the CPA panel: body is {project} (NOT {metadata}), tried across hosts in
-// order daily -> daily-sandbox -> prod. The same account reports DIFFERENT quota
-// per host environment (e.g. 88% weekly on daily vs 57% on prod); Antigravity
-// traffic is served by the daily host, so it is authoritative.
+// ---- antigravity / gemini code assist (VERIFIED) ----
+// Two upstream signals, both via /v0/management/api-call proxy:
+//   1. retrieveUserQuotaSummary → time-window buckets (Claude/GPT shared group on this account)
+//   2. loadCodeAssist           → paidTier.availableCredits (GOOGLE_ONE_AI credit balance, the
+//                                 Gemini-side quota) + tier info
+// The second is authoritative for "does this credential still have Gemini quota" — it's a
+// credit balance (amount vs minimumCreditAmountForUsage), not a percentage window.
 const ANTIGRAVITY_HOSTS = [
 	"https://daily-cloudcode-pa.googleapis.com",
 	"https://daily-cloudcode-pa.sandbox.googleapis.com",
@@ -243,24 +247,46 @@ const antigravityAdapter: Adapter = {
 	async fetch(base, key, cred) {
 		const authIndex = cred.auth_index as string;
 		const header = { ...BEARER, "Content-Type": "application/json", "User-Agent": ANTIGRAVITY_UA };
-		// project id comes from the auth-files listing; discover via loadCodeAssist if absent
+		const wins: Win[] = [];
+
+		// 1) loadCodeAssist → paidTier.availableCredits + tier. Always fetched (it also
+		//    hands us the project id when cred.project_id is absent).
 		let project = cred.project_id;
-		if (!project) {
-			try {
-				const body = await proxyCall(base, key, {
-					authIndex, method: "POST",
-					url: `${ANTIGRAVITY_HOSTS[0]}/v1internal:loadCodeAssist`,
-					header, body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-				});
-				const d = JSON.parse(body) as { cloudaicompanionProject?: unknown };
-				const cp = d.cloudaicompanionProject;
-				project = typeof cp === "string" ? cp : (cp as { id?: string } | undefined)?.id;
-			} catch {
-				// fall through to the legacy metadata call below
+		try {
+			const body = await proxyCall(base, key, {
+				authIndex, method: "POST",
+				url: `${ANTIGRAVITY_HOSTS[0]}/v1internal:loadCodeAssist`,
+				header, body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+			});
+			const d = JSON.parse(body) as {
+				cloudaicompanionProject?: unknown;
+				paidTier?: { id?: unknown; name?: unknown; availableCredits?: Array<Record<string, unknown>> };
+			};
+			const cp = d.cloudaicompanionProject;
+			project = project ?? (typeof cp === "string" ? cp : (cp as { id?: string } | undefined)?.id);
+			const tier = d.paidTier;
+			const tierName = typeof tier?.name === "string" ? tier.name : typeof tier?.id === "string" ? tier.id : "";
+			const credits = tier?.availableCredits ?? [];
+			const g1 = credits.find((c) => String(c.creditType ?? "").toUpperCase() === "GOOGLE_ONE_AI");
+			if (g1) {
+				const amt = toNum(g1.creditAmount);
+				const min = toNum(g1.minimumCreditAmountForUsage);
+				if (amt !== null) {
+					const pct = min !== null && min > 0 ? Math.min(100, (amt / min) * 100) : null;
+					wins.push({ label: `${tierName || "credits"} · GOOGLE_ONE_AI`, remainingPct: pct, resetIso: null });
+				} else {
+					// Google omits creditAmount when balance >= minimum (unconstrained).
+					// Show it as a state marker, not a fabricated 100% — remainingPct=null
+					// renders as "n/a" which is honest, and we put the real signal in the label.
+					wins.push({ label: `${tierName || "credits"} · GOOGLE_ONE_AI (≥${min ?? "?"})`, remainingPct: null, resetIso: null });
+				}
 			}
+		} catch {
+			// loadCodeAssist best-effort; quota summary still runs below
 		}
+
+		// 2) retrieveUserQuotaSummary → time-window buckets
 		if (project) {
-			let lastErr: unknown;
 			for (const host of ANTIGRAVITY_HOSTS) {
 				try {
 					const body = await proxyCall(base, key, {
@@ -268,22 +294,133 @@ const antigravityAdapter: Adapter = {
 						url: `${host}/v1internal:retrieveUserQuotaSummary`,
 						header, body: JSON.stringify({ project }),
 					});
-					return parseQuotaSummary(body);
-				} catch (err) {
-					lastErr = err;
+					wins.push(...parseQuotaSummary(body));
+					return wins;
+				} catch {
+					// next host
 				}
 			}
-			throw lastErr;
+		} else {
+			// no project id: legacy prod-host call
+			try {
+				const body = await proxyCall(base, key, {
+					authIndex, method: "POST",
+					url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+					header, body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+				});
+				wins.push(...parseQuotaSummary(body));
+			} catch {
+				// both signals failed — return whatever loadCodeAssist gave us
+			}
 		}
-		// no project id (e.g. plain gemini-cli credential): legacy prod-host call
-		const body = await proxyCall(base, key, {
-			authIndex,
+		return wins;
+	},
+};
+
+// ---- devin (VERIFIED): Connect-RPC GetUserStatus @ server.codeium.com ----
+// Devin's quota endpoint speaks protobuf over Connect-RPC, NOT the OAuth-bearer
+// proxy that /v0/management/api-call provides — so this adapter bypasses proxyCall
+// and hits the upstream directly. It reads the session_token from the credential
+// file that auth-files reports (cred.path), builds the wire request by hand, and
+// parses only the quota fields out of the (large) binary response.
+// Reference: CLIProxyAPI internal/auth/devin/user_status.go
+const DEVIN_STATUS_URL =
+	"https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+
+function devinFingerprint(seed: string): string {
+	let s = "";
+	let c = 0;
+	while (s.length < 732) s += createHash("sha256").update(`${seed}-${c++}`).digest("hex");
+	return s.slice(0, 732);
+}
+
+// protobuf wire helpers (bytes + varint only — all we need)
+function pbVarint(n: number | bigint): Buffer {
+	let v = BigInt(n);
+	const b: number[] = [];
+	do { b.push(Number(v & 0x7fn) | 0x80); v >>= 7n; } while (v > 0n);
+	b[b.length - 1] &= 0x7f;
+	return Buffer.from(b);
+}
+function pbStr(field: number, s: string): Buffer {
+	const b = Buffer.from(s, "utf8");
+	return Buffer.concat([pbVarint((field << 3) | 2), pbVarint(b.length), b]);
+}
+function* pbFields(buf: Buffer): Generator<{ f: number; wt: number; v?: bigint; b?: Buffer }> {
+	let i = 0;
+	const readV = (at: number): [bigint, number] => {
+		let v = 0n, s = 0n, n = 0;
+		while (true) { const x = buf[at + n]; v |= BigInt(x & 0x7f) << s; n++; if (!(x & 0x80)) break; s += 7n; }
+		return [v, n];
+	};
+	while (i < buf.length) {
+		const [key, kn] = readV(i); i += kn;
+		const f = Number(key >> 3n), wt = Number(key & 7n);
+		if (wt === 0) { const [v, n] = readV(i); yield { f, wt, v }; i += n; }
+		else if (wt === 2) { const [len, ln] = readV(i); i += ln; const n = Number(len); yield { f, wt, b: buf.subarray(i, i + n) }; i += n; }
+		else if (wt === 5) { yield { f, wt, b: buf.subarray(i, i + 4) }; i += 4; }
+		else if (wt === 1) { yield { f, wt, b: buf.subarray(i, i + 8) }; i += 8; }
+		else throw new Error(`protobuf wire type ${wt}`);
+	}
+}
+
+const devinAdapter: Adapter = {
+	verified: true,
+	async fetch(_base, _key, cred) {
+		// session_token lives in the credential file (auth-files gives us its path)
+		if (!cred.path) throw new Error("devin credential has no path field");
+		let token: string;
+		try {
+			token = (JSON.parse(readFileSync(cred.path, "utf8")) as { session_token?: string }).session_token ?? "";
+		} catch (e) {
+			throw new Error(`read devin credential: ${(e as Error).message}`);
+		}
+		if (!token) throw new Error("devin credential missing session_token");
+
+		const inner = Buffer.concat([
+			pbStr(1, "chisel"), pbStr(2, "3000.10.21"), pbStr(3, token),
+			pbStr(4, "en"), pbStr(5, "darwin"), pbStr(7, "3000.10.21"),
+			pbStr(12, "chisel"), pbStr(31, devinFingerprint(token)),
+		]);
+		const body = Buffer.concat([pbVarint((1 << 3) | 2), pbVarint(inner.length), inner]);
+		const res = await fetch(DEVIN_STATUS_URL, {
 			method: "POST",
-			url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-			header,
-			body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
+			headers: {
+				Authorization: `Basic ${token}-${token}`,
+				"Connect-Protocol-Version": "1",
+				"Content-Type": "application/proto",
+				Accept: "*/*",
+			},
+			body,
+			signal: AbortSignal.timeout(30_000),
 		});
-		return parseQuotaSummary(body);
+		if (!res.ok) throw new Error(`devin seat management HTTP ${res.status}`);
+		const buf = Buffer.from(await res.arrayBuffer());
+
+		// top-level f1 = user_status; inside it f13 = plan_status; inside plan_status
+		// f14=daily%, f15=weekly%, f17=dailyReset unix, f18=weeklyReset unix
+		const wins: Win[] = [];
+		for (const t of pbFields(buf)) {
+			if (t.f !== 1 || t.wt !== 2 || !t.b) continue;
+			for (const u of pbFields(t.b)) {
+				if (u.f !== 13 || u.wt !== 2 || !u.b) continue;
+				const iso = (sec: bigint) => new Date(Number(sec) * 1000).toISOString();
+				let dailyPct: number | null = null;
+				let weeklyPct: number | null = null;
+				let dailyReset: string | null = null;
+				let weeklyReset: string | null = null;
+				for (const p of pbFields(u.b)) {
+					if (p.wt !== 0 || p.v === undefined) continue;
+					if (p.f === 14) dailyPct = Number(p.v);
+					if (p.f === 15) weeklyPct = Number(p.v);
+					if (p.f === 17) dailyReset = iso(p.v);
+					if (p.f === 18) weeklyReset = iso(p.v);
+				}
+				if (weeklyPct !== null) wins.push({ label: "weekly", remainingPct: weeklyPct, resetIso: weeklyReset });
+				if (dailyPct !== null) wins.push({ label: "daily", remainingPct: dailyPct, resetIso: dailyReset });
+			}
+		}
+		return wins;
 	},
 };
 
@@ -380,11 +517,15 @@ const ADAPTERS: Record<string, Adapter> = {
 	kimi: kimiAdapter,
 	codex: codexAdapter,
 	xai: xaiAdapter,
+	devin: devinAdapter,
 };
 
 /** Guess which quota provider the current pi model routes to (by provider/id text). */
 export function providerFromModel(model: { provider?: string; id?: string } | undefined): string | null {
 	const s = `${model?.provider ?? ""} ${model?.id ?? ""}`.toLowerCase();
+	// Provider prefix wins over model-family keywords: "devin/claude-sonnet-4-6"
+	// routes to devin quota, not claude. Check devin/swe before claude/gemini.
+	if (s.includes("devin") || s.includes("swe-") || s.includes("swe_")) return "devin";
 	if (s.includes("claude")) return "claude";
 	if (s.includes("gemini") || s.includes("antigravity")) return "antigravity";
 	if (s.includes("codex") || s.includes("gpt")) return "codex";
@@ -481,6 +622,7 @@ function shortTag(label: string): string {
 	const l = label.toLowerCase();
 	if (l.includes("5h") || l.includes("5-hour") || l.includes("five")) return "5h";
 	if (l.includes("weekly") || l.includes("7-day") || l.includes("7d") || l.includes("week")) return "7d";
+	if (l.includes("daily") || l.includes("24h") || l.includes("day")) return "24h";
 	return label.split(/[ ·(]/)[0];
 }
 

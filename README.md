@@ -12,8 +12,8 @@ It surfaces subscription limits for reverse-proxied models inside pi:
 
 - **Quota** — see subscription limits for **every OAuth provider** the proxy holds without leaving pi.
 
-Supported providers: **Claude**, **Antigravity / Gemini Code Assist**, and **Kimi** (verified), plus
-**Codex** and **xAI / Grok** (best‑effort, shown as `(unverified)` until confirmed against a real
+Supported providers: **Claude**, **Antigravity / Gemini Code Assist**, **Kimi**, and **Devin**
+(verified), plus **Codex** and **xAI / Grok** (best‑effort, shown as `(unverified)` until confirmed against a real
 account — see [Scope](#scope--limitations)).
 
 ## Features
@@ -26,8 +26,12 @@ account — see [Scope](#scope--limitations)).
 
 The quota data path mirrors the EasyCLIProxyAPI control panel exactly: the proxy management API
 `POST /v0/management/api-call` proxies each provider's own usage endpoint (e.g. Anthropic
-`/api/oauth/usage`, Google `retrieveUserQuotaSummary`) using the stored OAuth credential. These
-endpoints report utilization; they do not consume quota. Disabled credentials are skipped.
+`/api/oauth/usage`, Google `retrieveUserQuotaSummary`/`loadCodeAssist`) using the stored OAuth
+credential. Devin is the exception: its quota is served over Connect-RPC at
+`server.codeium.com` (`SeatManagementService/GetUserStatus`, protobuf wire format) which the
+api-call proxy can't carry, so the extension reads the session token from the credential file
+and calls upstream directly. These endpoints report utilization; they do not consume quota.
+Disabled credentials are skipped.
 
 ## Install
 
@@ -84,7 +88,7 @@ MIT
 
 - **额度** — 在 pi 里直接看代理持有的**每个 OAuth 提供方**的订阅限额。
 
-支持的提供方：**Claude**、**Antigravity / Gemini Code Assist**、**Kimi**（已验证），以及 **Codex**、
+支持的提供方：**Claude**、**Antigravity / Gemini Code Assist**、**Kimi**、**Devin**（已验证），以及 **Codex**、
 **xAI / Grok**（尽力支持，在真实账号上校准前显示为 `(unverified)`）。
 
 ### 功能
@@ -97,7 +101,10 @@ MIT
 
 取数链路与 EasyCLIProxyAPI 控制面板完全一致：代理管理 API `POST /v0/management/api-call`
 用存储的 OAuth 凭证代理请求各提供方自己的用量端点（如 Anthropic `/api/oauth/usage`、
-Google `retrieveUserQuotaSummary`）。这些端点只报告用量，不消耗额度；禁用的凭证会跳过。
+Google `retrieveUserQuotaSummary`/`loadCodeAssist`）。**Devin 例外**：它的额度走 Connect-RPC
+（`server.codeium.com` 的 `SeatManagementService/GetUserStatus`，protobuf 线路格式），api-call
+透传带不了，扩展改为从凭证文件读 session_token 直连上游。这些端点只报告用量，不消耗额度；
+禁用的凭证会跳过。
 
 ### 安装
 
